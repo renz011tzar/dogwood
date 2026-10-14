@@ -394,6 +394,10 @@ fn eq_binding(env: &Env, trace: &Trace, i: usize, left: &Term, right: &Term) -> 
 /// here — the type annotation is not consulted by evaluation.
 fn project_dedup(rel: &[Row], vars: &[TypedBinder]) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
+    // Keyed by the rows' canonical encoding, which is equal exactly when
+    // `rows_eq` holds (`partition_value_key` agrees with `dom_eq`), so this
+    // is linear rather than quadratic in the number of occurrences.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in rel {
         let projected: Row = vars
             .iter()
@@ -404,11 +408,21 @@ fn project_dedup(rel: &[Row], vars: &[TypedBinder]) -> Vec<Row> {
                     .map(|(k, val)| (k.clone(), val.clone()))
             })
             .collect();
-        if !out.iter().any(|r| rows_eq(r, &projected)) {
+        if seen.insert(row_key(&projected)) {
             out.push(projected);
         }
     }
     out
+}
+
+/// Injective encoding of a row: equal keys iff `rows_eq`.
+fn row_key(row: &Row) -> String {
+    let mut key = String::new();
+    for (k, v) in row {
+        let value = crate::engine::partition_value_key(v);
+        key.push_str(&format!("{}:{}{}:{}", k.len(), k, value.len(), value));
+    }
+    key
 }
 
 /// Join two rows: union of columns, failing if they disagree on a
@@ -929,6 +943,56 @@ mod tests {
     }
 
     /// Evaluate `body` at the last timepoint of `tr`.
+    /// `project_dedup` keys rows by `row_key`; that is sound only if two
+    /// rows get the same key exactly when `rows_eq` holds. Checked pairwise
+    /// over values chosen to collide: decimal spellings, an int beside its
+    /// decimal and string forms, an entity beside a look-alike string,
+    /// nested decimals, a missing column, and column/value boundaries.
+    #[test]
+    fn row_key_agrees_with_rows_eq() {
+        let d = |x: &str| Value::Decimal(x.to_string());
+        let obj = |v: Value| Value::Object(BTreeMap::from([("k".to_string(), v)]));
+        let row = |cols: &[(&str, Value)]| -> Row { cols.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() };
+        let rows = vec![
+            row(&[("a", d("1.5"))]),
+            row(&[("a", d("1.50"))]),
+            row(&[("a", d("01.5"))]),
+            row(&[("a", d("1.6"))]),
+            row(&[("a", d("-0.0"))]),
+            row(&[("a", d("0.0"))]),
+            row(&[("a", d("not-a-decimal"))]),
+            row(&[("a", n(15))]),
+            row(&[("a", s("15"))]),
+            row(&[("a", s("1.5"))]),
+            row(&[("a", Value::Entity { ty: "T".into(), id: "x".into() })]),
+            row(&[("a", s("T::\"x\""))]),
+            row(&[("a", Value::Null)]),
+            row(&[("a", Value::Bool(true))]),
+            row(&[("a", Value::Array(vec![d("2.0")]))]),
+            row(&[("a", Value::Array(vec![d("2.00")]))]),
+            row(&[("a", Value::Array(vec![d("2.0"), d("2.0")]))]),
+            row(&[("a", obj(d("3.10")))]),
+            row(&[("a", obj(d("3.1")))]),
+            row(&[]),
+            row(&[("a", n(1)), ("b", n(2))]),
+            row(&[("b", n(2)), ("a", n(1))]),
+            row(&[("a", n(1))]),
+            row(&[("ab", s("c"))]),
+            row(&[("a", s("bc"))]),
+            row(&[("a", s("b")), ("c", s(""))]),
+            // Unframed, these would both encode as `as1:bci1:1`.
+            row(&[("a", s("b")), ("c", n(1))]),
+            row(&[("as1:bc", n(1))]),
+        ];
+        for x in &rows {
+            for y in &rows {
+                assert_eq!(rows_eq(x, y), row_key(x) == row_key(y), "{x:?} vs {y:?}");
+            }
+        }
+        // The cases above do exercise both sides.
+        assert!(rows_eq(&rows[0], &rows[1]) && !rows_eq(&rows[0], &rows[3]));
+    }
+
     fn holds(tr: &Trace, body: &str) -> bool {
         let cond = parse_condition(body).unwrap_or_else(|e| panic!("parse `{body}`: {e}"));
         let i = tr.len() - 1;
